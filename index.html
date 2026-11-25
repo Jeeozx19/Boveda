@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#175ddc">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Bóveda</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;margin:0;background:#f2f4f7;color:#111;font-size:16px}
+header{background:#175ddc;color:#fff;padding:12px 14px;display:flex;gap:8px;align-items:center;position:sticky;top:0;z-index:5}
+header h1{font-size:18px;margin:0;flex:1}
+main{padding:12px;max-width:640px;margin:auto}
+input,select,textarea,button{font:inherit;padding:10px;border:1px solid #bbb;border-radius:8px;width:100%;margin:4px 0}
+textarea{min-height:70px}
+button{background:#175ddc;color:#fff;border:0;cursor:pointer;width:auto;padding:10px 14px}
+button.sec{background:#e3e6ea;color:#111}
+button.red{background:#c62828}
+header button{background:#ffffff33;padding:8px 10px}
+.card{background:#fff;border-radius:10px;padding:12px;margin:8px 0;box-shadow:0 1px 3px #0002}
+.card b{display:block}
+.small{font-size:13px;color:#555}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.row>*{flex:0 0 auto}
+.tabs{display:flex;gap:6px;margin:8px 0}
+.tabs button{flex:1;background:#e3e6ea;color:#111}
+.tabs button.on{background:#175ddc;color:#fff}
+.field{display:flex;gap:6px;align-items:center;margin:4px 0}
+.field input{flex:1}
+.field button{padding:8px 10px}
+label{font-size:13px;color:#444;display:block;margin-top:6px}
+.hide{display:none}
+.msg{color:#c62828;font-size:14px;min-height:18px}
+.full{width:100%}
+</style>
+</head>
+<body>
+<header><h1>🔐 Bóveda</h1><button id="btnMenu" class="hide">⋮ Menú</button><button id="btnLock" class="hide">Bloquear</button></header>
+<main id="app"></main>
+
+<script>
+"use strict";
+const LS_KEY = "boveda_v1", LS_BIO = "boveda_bio";
+const $ = s => document.querySelector(s);
+const enc = new TextEncoder(), dec = new TextDecoder();
+let key = null, salt = null, data = { items: [] }, tab = "all", q = "", lockTimer = null;
+
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function deriveKey(pass, saltBytes) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt: saltBytes, iterations: 250000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+async function encryptData() {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(data)));
+  return { v: 1, salt: b64(salt), iv: b64(iv), ct: b64(ct) };
+}
+async function decryptBlob(blob, k) {
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(blob.iv) }, k, unb64(blob.ct));
+  return JSON.parse(dec.decode(pt));
+}
+async function save() { localStorage.setItem(LS_KEY, JSON.stringify(await encryptData())); }
+
+function resetLock() {
+  clearTimeout(lockTimer);
+  if (key) lockTimer = setTimeout(lock, 3 * 60 * 1000);
+}
+["click", "keydown", "touchstart"].forEach(e => document.addEventListener(e, resetLock));
+document.addEventListener("visibilitychange", () => {
+  if (!key) return;
+  clearTimeout(lockTimer);
+  lockTimer = setTimeout(lock, document.hidden ? 60 * 1000 : 3 * 60 * 1000);
+});
+function lock() { key = null; data = { items: [] }; render(); }
+
+function genPass(len = 18) {
+  const chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*?-_";
+  const r = crypto.getRandomValues(new Uint32Array(len));
+  return Array.from(r, n => chars[n % chars.length]).join("");
+}
+function uid() { return crypto.getRandomValues(new Uint32Array(2)).join("-") + Date.now(); }
+async function copy(t) {
+  try { await navigator.clipboard.writeText(t); toast("Copiado (se borra en 30 s)"); setTimeout(() => navigator.clipboard.writeText("").catch(()=>{}), 30000); }
+  catch { prompt("Copia manualmente:", t); }
+}
+function toast(m) {
+  const d = document.createElement("div");
+  d.textContent = m;
+  d.style.cssText = "position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:20px;z-index:99";
+  document.body.appendChild(d); setTimeout(() => d.remove(), 2200);
+}
+
+/* ---------- Huella (WebAuthn + PRF) ---------- */
+const bioAvailable = () => !!(window.PublicKeyCredential && navigator.credentials && location.protocol === "https:" || location.hostname === "localhost");
+const bioEnabled = () => !!localStorage.getItem(LS_BIO);
+async function bioWrapKey(prfOut) {
+  const base = await crypto.subtle.importKey("raw", prfOut, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: enc.encode("boveda-bio") },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+async function bioGet(credId, prfSalt) {
+  const a = await navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)), rpId: location.hostname,
+    allowCredentials: [{ type: "public-key", id: credId }], userVerification: "required",
+    extensions: { prf: { eval: { first: prfSalt } } } } });
+  const r = a.getClientExtensionResults().prf;
+  return r && r.results && r.results.first;
+}
+async function enableBio() {
+  const pw = prompt("Escribe tu contraseña maestra para activar la huella:");
+  if (!pw) return;
+  try {
+    const k = await deriveKey(pw, salt);
+    await decryptBlob(JSON.parse(localStorage.getItem(LS_KEY)), k);
+  } catch { return alert("Contraseña incorrecta"); }
+  try {
+    const prfSalt = crypto.getRandomValues(new Uint8Array(32));
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: "Bóveda", id: location.hostname },
+      user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "boveda", displayName: "Bóveda" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "preferred" },
+      extensions: { prf: { eval: { first: prfSalt } } } } });
+    const credId = new Uint8Array(cred.rawId);
+    const ext = cred.getClientExtensionResults().prf;
+    let out = ext && ext.results && ext.results.first;
+    if (!out) out = await bioGet(credId, prfSalt);
+    if (!out) throw new Error("PRF no soportado");
+    const wk = await bioWrapKey(out);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wk, enc.encode(pw));
+    localStorage.setItem(LS_BIO, JSON.stringify({ cid: b64(credId), ps: b64(prfSalt), iv: b64(iv), ct: b64(ct) }));
+    toast("Huella activada");
+  } catch (e) {
+    alert("No se pudo activar la huella en este navegador/teléfono (" + (e.name || e.message) + "). Prueba con Chrome.");
+  }
+}
+async function bioPassword() {
+  const b = JSON.parse(localStorage.getItem(LS_BIO));
+  const out = await bioGet(unb64(b.cid), unb64(b.ps));
+  if (!out) throw new Error("sin PRF");
+  const wk = await bioWrapKey(out);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(b.iv) }, wk, unb64(b.ct));
+  return dec.decode(pt);
+}
+
+/* ---------- Desbloqueo ---------- */
+async function unlockWith(pw) {
+  const blob = JSON.parse(localStorage.getItem(LS_KEY));
+  const s = unb64(blob.salt), k = await deriveKey(pw, s);
+  data = await decryptBlob(blob, k); key = k; salt = s;
+  resetLock(); render();
+}
+async function tryBio(err) {
+  try { await unlockWith(await bioPassword()); }
+  catch (e) { if (err && e.name !== "NotAllowedError") err.textContent = "Huella no disponible, usa tu contraseña"; }
+}
+
+/* ---------- Vistas ---------- */
+function render() {
+  $("#btnLock").classList.toggle("hide", !key);
+  $("#btnMenu").classList.toggle("hide", !key);
+  if (!window.crypto || !crypto.subtle) {
+    $("#app").innerHTML = '<div class="card">Este navegador no permite cifrado. Abre esta página con HTTPS en Chrome o Brave.</div>'; return;
+  }
+  if (!key) return renderLogin();
+  renderList();
+}
+function renderLogin(autoBio = true) {
+  const exists = !!localStorage.getItem(LS_KEY);
+  const bio = exists && bioEnabled();
+  $("#app").innerHTML = `<div class="card">
+    <h3>${exists ? "Desbloquear" : "Crear bóveda"}</h3>
+    ${exists ? "" : '<p class="small">Elige una contraseña maestra fuerte. <b>Si la olvidas no hay forma de recuperar los datos.</b></p>'}
+    ${bio ? '<button id="bio" class="full">👆 Entrar con huella</button><p class="small">o con contraseña:</p>' : ""}
+    <input id="pw" type="password" placeholder="Contraseña maestra" autocomplete="off">
+    ${exists ? "" : '<input id="pw2" type="password" placeholder="Repite la contraseña" autocomplete="off">'}
+    <div class="msg" id="err"></div>
+    <button id="go">${exists ? "Entrar" : "Crear"}</button>
+    <button class="sec" id="imp">${exists ? "Restaurar desde respaldo" : "Ya tengo un respaldo"}</button>
+  </div>`;
+  $("#go").onclick = async () => {
+    const pw = $("#pw").value, err = $("#err");
+    err.textContent = "";
+    if (!pw) return;
+    $("#go").disabled = true;
+    try {
+      if (exists) await unlockWith(pw);
+      else {
+        if (pw.length < 8) throw new Error("Mínimo 8 caracteres");
+        if (pw !== $("#pw2").value) throw new Error("Las contraseñas no coinciden");
+        salt = crypto.getRandomValues(new Uint8Array(16));
+        key = await deriveKey(pw, salt); data = { items: [] }; await save();
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
+        resetLock(); render();
+      }
+    } catch (e) {
+      err.textContent = exists ? "Contraseña incorrecta" : e.message;
+      $("#go").disabled = false;
+    }
+  };
+  $("#pw").onkeydown = e => { if (e.key === "Enter") $("#go").click(); };
+  $("#imp").onclick = importBackup;
+  if (bio) { $("#bio").onclick = () => tryBio($("#err")); if (autoBio) tryBio(null); }
+}
+function renderList() {
+  let items = data.items.filter(i => tab === "all" || i.type === tab);
+  if (q) { const t = q.toLowerCase(); items = items.filter(i => JSON.stringify(i).toLowerCase().includes(t)); }
+  items.sort((a, b) => a.title.localeCompare(b.title));
+  $("#app").innerHTML = `
+    <input id="q" placeholder="Buscar..." value="${esc(q)}">
+    <div class="tabs">
+      <button data-t="all" class="${tab==="all"?"on":""}">Todo</button>
+      <button data-t="pass" class="${tab==="pass"?"on":""}">Contraseñas</button>
+      <button data-t="biz" class="${tab==="biz"?"on":""}">Negocios</button>
+    </div>
+    <button id="add">+ Nuevo registro</button>
+    ${items.map(i => `<div class="card" data-id="${i.id}"><b>${esc(i.title)}</b>
+      <span class="small">${i.type==="pass"?"🔑 "+esc(i.user||""):"🏢 "+esc(i.contact||i.phone||"")}</span></div>`).join("") || '<p class="small">Sin registros.</p>'}`;
+  $("#q").oninput = e => { q = e.target.value; const p = e.target.selectionStart; renderList(); const n = $("#q"); n.focus(); n.setSelectionRange(p, p); };
+  document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { tab = b.dataset.t; renderList(); });
+  $("#add").onclick = () => renderForm(null);
+  document.querySelectorAll(".card[data-id]").forEach(c => c.onclick = () => renderDetail(c.dataset.id));
+}
+const FIELDS = {
+  pass: [["user","Usuario / correo"],["password","Contraseña","secret"],["url","Sitio web"],["notes","Notas","area"]],
+  biz:  [["contact","Contacto / razón social"],["phone","Teléfono"],["email","Correo"],["rfc","RFC / ID fiscal"],["address","Dirección"],["bank","Datos bancarios","secret"],["notes","Notas","area"]]
+};
+function renderDetail(id) {
+  const it = data.items.find(i => i.id === id);
+  $("#app").innerHTML = `<div class="card"><h3>${esc(it.title)}</h3>
+    ${FIELDS[it.type].map(([k, l, t]) => it[k] ? `<label>${l}</label><div class="field">
+      <input readonly data-k="${k}" type="${t==="secret"?"password":"text"}" value="${esc(it[k])}">
+      ${t==="secret"?'<button class="sec" data-show="'+k+'">👁</button>':""}
+      <button class="sec" data-copy="${k}">Copiar</button></div>` : "").join("")}
+    <div class="row" style="margin-top:12px">
+      <button id="edit">Editar</button><button class="sec" id="back">Volver</button><button class="red" id="del">Eliminar</button></div></div>`;
+  document.querySelectorAll("[data-copy]").forEach(b => b.onclick = () => copy(it[b.dataset.copy]));
+  document.querySelectorAll("[data-show]").forEach(b => b.onclick = () => {
+    const i = document.querySelector(`input[data-k="${b.dataset.show}"]`); i.type = i.type === "password" ? "text" : "password"; });
+  $("#back").onclick = renderList;
+  $("#edit").onclick = () => renderForm(it);
+  $("#del").onclick = async () => { if (confirm("¿Eliminar este registro?")) { data.items = data.items.filter(i => i.id !== id); await save(); renderList(); } };
+}
+function renderForm(it) {
+  const cur = it ? { ...it } : { id: uid(), type: tab === "biz" ? "biz" : "pass", title: "" };
+  const collect = () => {
+    cur.title = $("#f_title").value;
+    FIELDS[cur.type].forEach(([k]) => { const e = $("#f_" + k); if (e) cur[k] = e.value; });
+  };
+  const draw = () => {
+    $("#app").innerHTML = `<div class="card"><h3>${it ? "Editar" : "Nuevo"} registro</h3>
+      <label>Tipo</label><select id="type" ${it ? "disabled" : ""}>
+        <option value="pass" ${cur.type==="pass"?"selected":""}>Contraseña</option>
+        <option value="biz" ${cur.type==="biz"?"selected":""}>Datos de negocio</option></select>
+      <label>Nombre / título</label><input id="f_title" value="${esc(cur.title)}">
+      ${FIELDS[cur.type].map(([k, l, t]) => `<label>${l}</label>` + (t === "area"
+        ? `<textarea id="f_${k}">${esc(cur[k] || "")}</textarea>`
+        : `<div class="field"><input id="f_${k}" type="text" value="${esc(cur[k] || "")}">${k==="password"?'<button class="sec" id="gen">Generar</button>':""}</div>`)).join("")}
+      <div class="msg" id="err"></div>
+      <div class="row"><button id="ok">Guardar</button><button class="sec" id="cancel">Cancelar</button></div></div>`;
+    $("#type").onchange = e => { collect(); cur.type = e.target.value; draw(); };
+    if ($("#gen")) $("#gen").onclick = () => { $("#f_password").value = genPass(); };
+    $("#cancel").onclick = renderList;
+    $("#ok").onclick = async () => {
+      collect();
+      if (!cur.title.trim()) { $("#err").textContent = "Pon un título"; return; }
+      if (!it) data.items.push(cur); else Object.assign(it, cur);
+      await save(); renderList();
+    };
+  };
+  draw();
+}
+
+/* ---------- Menú ---------- */
+$("#btnLock").onclick = lock;
+$("#btnMenu").onclick = () => {
+  const bio = bioEnabled();
+  $("#app").innerHTML = `<div class="card"><h3>Menú</h3>
+    <p class="small">${data.items.length} registros guardados en este dispositivo.</p>
+    <button id="exp">Descargar respaldo cifrado</button>
+    <button class="sec" id="imp2">Restaurar respaldo</button>
+    ${bioAvailable() ? `<button class="sec" id="bio">${bio ? "Desactivar huella" : "Activar huella"}</button>` : ""}
+    <button class="sec" id="chg">Cambiar contraseña maestra</button>
+    <button class="sec" id="back">Volver</button></div>`;
+  $("#back").onclick = renderList;
+  $("#exp").onclick = async () => {
+    const blob = new Blob([JSON.stringify(await encryptData())], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "boveda-respaldo-" + new Date().toISOString().slice(0, 10) + ".json";
+    a.click();
+  };
+  $("#imp2").onclick = importBackup;
+  if ($("#bio")) $("#bio").onclick = async () => {
+    if (bio) { localStorage.removeItem(LS_BIO); toast("Huella desactivada"); }
+    else await enableBio();
+    $("#btnMenu").click();
+  };
+  $("#chg").onclick = async () => {
+    const p1 = prompt("Nueva contraseña maestra (mín. 8):");
+    if (!p1 || p1.length < 8) return;
+    if (p1 !== prompt("Repítela:")) return alert("No coinciden");
+    salt = crypto.getRandomValues(new Uint8Array(16));
+    key = await deriveKey(p1, salt); await save();
+    localStorage.removeItem(LS_BIO);
+    toast("Contraseña cambiada. Vuelve a activar la huella si la usabas.");
+  };
+};
+function importBackup() {
+  const f = document.createElement("input"); f.type = "file"; f.accept = ".json,application/json";
+  f.onchange = async () => {
+    try {
+      const blob = JSON.parse(await f.files[0].text());
+      if (!blob.ct || !blob.salt) throw 0;
+      const pw = prompt("Contraseña maestra de ese respaldo:");
+      const s = unb64(blob.salt), k = await deriveKey(pw || "", s);
+      const d = await decryptBlob(blob, k);
+      if (!confirm("Esto reemplaza los datos actuales de este dispositivo. ¿Continuar?")) return;
+      localStorage.setItem(LS_KEY, JSON.stringify(blob));
+      localStorage.removeItem(LS_BIO);
+      data = d; key = k; salt = s; resetLock(); render(); toast("Restaurado");
+    } catch { alert("Archivo o contraseña inválidos"); }
+  };
+  f.click();
+}
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+render();
+</script>
+</body>
+</html>
